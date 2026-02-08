@@ -1,0 +1,11 @@
+{
+  "format": "easyocr_offline_v2",
+  "files": [
+    "craft_mlt_25k.pth",
+    "english_g2.pth"
+  ],
+  "total_size_mb": 93.74268245697021,
+  "compressed_size_mb": 86.98134803771973,
+  "num_chunks": 3,
+  "chunk_pattern": "models_part{n}.txt"
+}
