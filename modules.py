@@ -172,6 +172,28 @@ class Job(Base):
 
 Base.metadata.create_all(engine)
 
+# Migration: Add anchor_text column to existing databases
+def run_migrations():
+    """Add new columns to existing database tables"""
+    from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+    
+    # Check if labeled_boxes table exists and needs migration
+    if 'labeled_boxes' in inspector.get_table_names():
+        columns = [col['name'] for col in inspector.get_columns('labeled_boxes')]
+        
+        # Add anchor_text column if missing
+        if 'anchor_text' not in columns:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE labeled_boxes ADD COLUMN anchor_text TEXT"))
+                conn.commit()
+                print("[DB Migration] Added anchor_text column to labeled_boxes")
+
+try:
+    run_migrations()
+except Exception as e:
+    print(f"[DB Migration Warning] {e}")
+
 # ============================================================================
 # UTILITY CLASSES
 # ============================================================================

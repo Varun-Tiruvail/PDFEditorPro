@@ -167,17 +167,17 @@ class OCRImageTrainerModule(QWidget):
         nav_layout.addWidget(self.btn_next)
         left_panel.addLayout(nav_layout)
         
-        # --- OCR Controls ---
-        ocr_section = QLabel("🔍 OCR")
+        # --- OCR Info ---
+        ocr_section = QLabel("🔍 OCR Info")
         ocr_section.setStyleSheet("font-weight: bold; margin-top: 10px;")
         left_panel.addWidget(ocr_section)
         
-        self.btn_run_ocr = QPushButton("🔤 Run OCR on Page")
-        self.btn_run_ocr.clicked.connect(self.run_ocr_on_page)
-        self.btn_run_ocr.setStyleSheet("background: #FF5722; color: white; padding: 8px;")
-        left_panel.addWidget(self.btn_run_ocr)
+        ocr_info = QLabel("Draw anchor boxes to auto-capture text.\nOCR runs only inside drawn boxes.")
+        ocr_info.setWordWrap(True)
+        ocr_info.setStyleSheet("color: #666; font-size: 11px;")
+        left_panel.addWidget(ocr_info)
         
-        self.ocr_status_label = QLabel("OCR: Not run")
+        self.ocr_status_label = QLabel("OCR: Ready")
         left_panel.addWidget(self.ocr_status_label)
         
         # --- Zoom Controls ---
@@ -538,6 +538,8 @@ class OCRImageTrainerModule(QWidget):
         )
         ocr_box = OCRBox(ocr_rect, box.name, box.box_type, box.parent)
         ocr_box.id = box.id
+        # CRITICAL: Copy anchor_text (was missing, causing NULL in DB!)
+        ocr_box.anchor_text = getattr(box, 'anchor_text', None)
         
         # Recursively convert children
         for child in box.children:
@@ -560,6 +562,8 @@ class OCRImageTrainerModule(QWidget):
         )
         canvas_box = OCRBox(canvas_rect, box.name, box.box_type, box.parent)
         canvas_box.id = box.id
+        # Copy anchor_text to preserve it during conversion
+        canvas_box.anchor_text = getattr(box, 'anchor_text', None)
         
         # Recursively convert children
         for child in box.children:
@@ -1019,6 +1023,7 @@ class OCRImageTrainerModule(QWidget):
                     })
                     label_info[label_box.id] = {
                         'name': label_box.name,
+                        'label_box': label_box,  # Keep reference for label_rect calculation
                         'anchors': anchors,
                         'values': values,
                         'page_width': ocr_page.page_width,
@@ -1060,7 +1065,7 @@ class OCRImageTrainerModule(QWidget):
                     match = self._find_box_with_ocr(
                         doc, info['anchors'], info['values'],
                         info['page_width'], info['page_height'],
-                        pdf_path
+                        pdf_path, info.get('label_box')
                     )
                     
                     if match:
@@ -1074,6 +1079,7 @@ class OCRImageTrainerModule(QWidget):
                                 'pdf_path': pdf_path,
                                 'page_idx': match['page'],
                                 'value_rect': match['value_rect'],
+                                'label_rect': match.get('label_rect'),  # For label snip in backup
                                 'label_name': label['name'],
                                 'value_text': match['value_text'],
                                 'pdf_filename': pdf_filename
@@ -1110,7 +1116,7 @@ class OCRImageTrainerModule(QWidget):
         finally:
             session.close()
     
-    def _find_box_with_ocr(self, doc, anchors, values, page_width, page_height, pdf_path):
+    def _find_box_with_ocr(self, doc, anchors, values, page_width, page_height, pdf_path, label_box=None):
         """Find box content using OCR anchor text search approach.
         
         Approach:
@@ -1118,6 +1124,7 @@ class OCRImageTrainerModule(QWidget):
         2. Search for the anchor_text captured during training
         3. When found, apply relative offset to locate value box
         4. Extract text from value box region
+        5. Calculate label_rect for backup screenshot
         """
         if not anchors or not values:
             return None
@@ -1126,20 +1133,30 @@ class OCRImageTrainerModule(QWidget):
         first_value = values[0]
         
         # Get the stored anchor text (captured during training)
-        anchor_search_text = getattr(first_anchor, 'anchor_text', '') or first_anchor.name
+        anchor_search_text = getattr(first_anchor, 'anchor_text', '') or ''
         if not anchor_search_text or anchor_search_text.startswith("Anchor:"):
             # Fallback to extracting from name if anchor_text not stored
-            anchor_search_text = first_anchor.name.replace("Anchor: ", "").replace("...", "")
+            name = getattr(first_anchor, 'name', '')
+            anchor_search_text = name.replace("Anchor: ", "").replace("...", "").strip()
         
-        # Get primary anchor rect for relative offset calculation
-        primary_anchor_rect = QRectF(first_anchor.x, first_anchor.y, 
-                                      first_anchor.width, first_anchor.height)
+        if not anchor_search_text:
+            print(f"[DEBUG] No anchor_text found for extraction")
+            return None
         
-        # Calculate value offset from primary anchor
+        # Calculate relative offsets from template positions
+        # value_dx/dy = how far value is from anchor in template
         value_dx = first_value.x - first_anchor.x
         value_dy = first_value.y - first_anchor.y
         value_w = first_value.width
         value_h = first_value.height
+        
+        # Calculate label offset if label_box provided
+        label_dx, label_dy, label_w, label_h = None, None, None, None
+        if label_box:
+            label_dx = label_box.x - first_anchor.x
+            label_dy = label_box.y - first_anchor.y
+            label_w = label_box.width
+            label_h = label_box.height
         
         # Search all pages with OCR
         for page_idx in range(len(doc)):
@@ -1195,10 +1212,27 @@ class OCRImageTrainerModule(QWidget):
                         value_h
                     )
                     
-                    # Get text in value region
-                    value_text = self._get_text_in_rect_from_words(words, value_rect)
+                    # CRITICAL FIX: Run OCR on cropped value region instead of filtering words
+                    # (EasyOCR often returns full lines as single words, so word filtering fails)
+                    value_text = self._ocr_cropped_region(pil_image, value_rect)
                     
                     if value_text:
+                        # Calculate label_rect if we have label offsets
+                        label_rect_fitz = None
+                        if label_dx is not None:
+                            label_rect = QRectF(
+                                anchor_found['left'] + label_dx,
+                                anchor_found['top'] + label_dy,
+                                label_w,
+                                label_h
+                            )
+                            label_rect_fitz = fitz.Rect(
+                                label_rect.x() * 72 / OCR_DPI,
+                                label_rect.y() * 72 / OCR_DPI,
+                                (label_rect.x() + label_rect.width()) * 72 / OCR_DPI,
+                                (label_rect.y() + label_rect.height()) * 72 / OCR_DPI
+                            )
+                        
                         return {
                             'page': page_idx,
                             'anchor_text': anchor_found['text'],
@@ -1208,7 +1242,8 @@ class OCRImageTrainerModule(QWidget):
                                 value_rect.y() * 72 / OCR_DPI,
                                 (value_rect.x() + value_rect.width()) * 72 / OCR_DPI,
                                 (value_rect.y() + value_rect.height()) * 72 / OCR_DPI
-                            )
+                            ),
+                            'label_rect': label_rect_fitz  # For backup screenshot
                         }
                 
             except Exception as e:
@@ -1217,13 +1252,54 @@ class OCRImageTrainerModule(QWidget):
         
         return None
     
+    def _ocr_cropped_region(self, pil_image, rect):
+        """Crop image to rect and run OCR on just that region.
+        
+        This is more accurate than filtering full-page words because:
+        - EasyOCR often returns full lines as single words
+        - Cropping ensures we only get text INSIDE the box
+        """
+        try:
+            x1 = max(0, int(rect.x()))
+            y1 = max(0, int(rect.y()))
+            x2 = min(pil_image.width, int(rect.x() + rect.width()))
+            y2 = min(pil_image.height, int(rect.y() + rect.height()))
+            
+            if x2 <= x1 or y2 <= y1:
+                return ""
+            
+            cropped = pil_image.crop((x1, y1, x2, y2))
+            img_array = np.array(cropped)
+            
+            reader = get_ocr_reader()
+            if reader is None:
+                return ""
+            
+            ocr_results = reader.readtext(img_array)
+            texts = [text.strip() for bbox, text, conf in ocr_results if text.strip()]
+            return " ".join(texts)
+            
+        except Exception as e:
+            print(f"[DEBUG] _ocr_cropped_region error: {e}")
+            return ""
+    
     def _get_text_in_rect_from_words(self, words, rect):
-        """Get text from word list that falls within rect (OCR coordinates)"""
+        """Get text from words whose CENTER falls within rect (OCR coordinates).
+        
+        Uses center-point containment for precise extraction - only includes
+        words whose center point is INSIDE the rect, not just touching it.
+        """
         texts = []
         for word in words:
-            word_rect = QRectF(word['left'], word['top'], word['width'], word['height'])
-            if rect.intersects(word_rect):
+            # Calculate word center point
+            word_cx = word['left'] + word['width'] / 2
+            word_cy = word['top'] + word['height'] / 2
+            
+            # Check if center is inside rect
+            if (rect.x() <= word_cx <= rect.x() + rect.width() and
+                rect.y() <= word_cy <= rect.y() + rect.height()):
                 texts.append(word['text'])
+        
         return ' '.join(texts)
     
     # =================== Export Functions ===================
